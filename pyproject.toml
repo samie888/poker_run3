@@ -1,0 +1,5 @@
+[project]
+name = "poker-run3"
+version = "0.1.0"
+description = "Action-frequency detector"
+requires-python = ">=3.10"

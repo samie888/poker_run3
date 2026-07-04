@@ -1,0 +1,20 @@
+{
+  "model_name": "poker44-freq-detector",
+  "model_version": "1",
+  "framework": "mlp-runtime",
+  "license": "MIT",
+  "repo_url": "https://github.com/samie888/poker_run3",
+  "artifact_sha256": "5363d41bb22f38cb928549209a5cb1ddf66026750353e7b5fb83c0c85f4f7c4c",
+  "open_source": true,
+  "inference_mode": "local-joblib",
+  "data_attestation": "No validator-private evaluation labels are used for training. Training uses released benchmark data and local runtime features.",
+  "implementation_files": [
+    "neurons/miner.py",
+    "src/poker44_model_base/loader.py",
+    "poker44_ml/inference.py",
+    "poker44_ml/features.py",
+    "poker44_ml/stacked.py",
+    "poker44_ml/calibration.py",
+    "poker44/validator/payload_view.py"
+  ]
+}

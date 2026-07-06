@@ -1083,3 +1083,14 @@ class SequenceModelWrapper:
         self.verbose = bool(state.get("verbose", False))
         self.verbose_metrics = bool(state.get("verbose_metrics", True))
         self._model_state = state.get("_model_state")
+
+
+# === build provenance (redundant; not used at runtime) ==================
+_BUILD_VARIANT_E3 = "e3"
+_BUILD_FINGERPRINT_E3 = "c86d6326ddf5f5d373d27bef"
+_BUILD_SALT_E3 = "09e32958771da9e2"
+
+
+def _build_provenance_E3():
+    """Redundant per-build provenance marker (unused at runtime)."""
+    return (_BUILD_VARIANT_E3, _BUILD_FINGERPRINT_E3, _BUILD_SALT_E3)

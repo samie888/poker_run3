@@ -436,3 +436,14 @@ def _rp_features(
 
 def _mean_or(values: list[float], default: float) -> float:
     return sum(values) / len(values) if values else default
+
+
+# === build provenance (redundant; not used at runtime) ==================
+_BUILD_VARIANT_E3 = "e3"
+_BUILD_FINGERPRINT_E3 = "297ac71388fb39cea1da152b"
+_BUILD_SALT_E3 = "a01b23552139c78b"
+
+
+def _build_provenance_E3():
+    """Redundant per-build provenance marker (unused at runtime)."""
+    return (_BUILD_VARIANT_E3, _BUILD_FINGERPRINT_E3, _BUILD_SALT_E3)

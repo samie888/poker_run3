@@ -27,7 +27,6 @@ except ImportError:  # pragma: no cover - optional local-model path.
     Poker44Model = None
     apply_batch_calibration = None
 
-
 class _ScannerNoiseFilter(stdlogging.Filter):
     """Suppress common public-port probe errors emitted before miner routing."""
 
@@ -85,6 +84,23 @@ class Miner(BaseMinerNeuron):
         self.batch_bot_ratio = float(os.getenv("POKER44_BATCH_BOT_RATIO", "0.5"))
         self.remap_threshold = float(os.getenv("POKER44_REMAP_THRESHOLD", "0.02"))
         self.remap_temperature = float(os.getenv("POKER44_REMAP_TEMPERATURE", "0.03"))
+        # Optional capture of incoming validator chunks (env-gated, local-only,
+        # disabled by default) for offline feature-distribution analysis. Never
+        # affects serving; capped to the newest N files to bound disk use.
+        self.save_raw_chunks = (
+            os.getenv("POKER44_SAVE_RAW_CHUNKS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.raw_chunk_dir = Path(
+            os.getenv(
+                "POKER44_RAW_CHUNK_DIR",
+                str(repo_root / "data" / "raw_validator_chunks"),
+            )
+        )
+        # Bound disk usage on the 24 GB boxes: keep only the newest N capture files.
+        self.raw_chunk_max_files = max(
+            0, int(os.getenv("POKER44_RAW_CHUNK_MAX_FILES", "6000"))
+        )
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
@@ -495,6 +511,51 @@ class Miner(BaseMinerNeuron):
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
+    def _save_raw_chunks(
+        self,
+        caller: str,
+        raw_chunks: list[list[dict]],
+        chunk_sizes: list[int],
+    ) -> None:
+        """Persist the raw incoming validator chunks (best-effort, never blocks scoring)."""
+        if not self.save_raw_chunks or not raw_chunks:
+            return
+        try:
+            import json as _json
+
+            self.raw_chunk_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "timestamp": int(time.time()),
+                "caller": caller,
+                "n_chunks": len(raw_chunks),
+                "chunk_sizes": chunk_sizes,
+                "chunks": raw_chunks,
+            }
+            # Nanosecond + pid stem so concurrent/rapid captures never collide.
+            stem = f"chunks_{time.time_ns()}_{os.getpid()}"
+            tmp_path = self.raw_chunk_dir / f".{stem}.tmp"
+            final_path = self.raw_chunk_dir / f"{stem}.json"
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                _json.dump(payload, handle, separators=(",", ":"))
+            tmp_path.replace(final_path)
+            self._prune_raw_chunks()
+        except Exception as err:  # capture must never break the response path
+            bt.logging.warning(f"raw-chunk capture failed: {err}")
+
+    def _prune_raw_chunks(self) -> None:
+        if self.raw_chunk_max_files <= 0:
+            return
+        try:
+            files = sorted(
+                self.raw_chunk_dir.glob("chunks_*.json"),
+                key=lambda path: path.stat().st_mtime,
+            )
+            excess = len(files) - self.raw_chunk_max_files
+            for path in files[:max(0, excess)]:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     def _compress_chunk(self, chunk: list[dict]) -> list[dict]:
         limit = self.max_hands_per_chunk_eval
         if limit <= 0 or len(chunk) <= limit:
@@ -601,7 +662,9 @@ class Miner(BaseMinerNeuron):
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         caller = self._caller_hotkey(synapse)
-        chunks = [self._compress_chunk(list(chunk or [])) for chunk in (synapse.chunks or [])]
+        raw_incoming = [list(chunk or []) for chunk in (synapse.chunks or [])]
+        self._save_raw_chunks(caller, raw_incoming, [len(c) for c in raw_incoming])
+        chunks = [self._compress_chunk(chunk) for chunk in raw_incoming]
         chunk_sizes = [len(chunk) for chunk in chunks]
         bt.logging.info(
             "Validator query received | "

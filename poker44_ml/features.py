@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip as _gzip
 import math
 from collections import Counter
 from typing import Any
@@ -293,4 +294,145 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     out["schema_low_action_entropy_hand_rate"] = _safe_div(low_action_entropy, n)
     out["schema_high_actor_entropy_hand_rate"] = _safe_div(high_actor_entropy, n)
     out["schema_long_action_hand_rate"] = _safe_div(long_action_hand, n)
+    out.update(_rp_features(action_signatures, amount_bucket_signatures, street_signatures))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# rp_* : size-invariant self-redundancy of the chunk's bag of hands.
+# Bots replay near-identical sequences; humans vary. All values are ratios /
+# per-hand-normalized so 30-hand and 100-hand chunks are comparable. Pairwise
+# work is capped at _RP_MAX_HANDS via deterministic stride subsampling.
+# --------------------------------------------------------------------------- #
+
+_RP_MAX_HANDS = 60
+
+
+def _rp_ngram_set(seq: tuple, size: int) -> frozenset:
+    if len(seq) < size:
+        return frozenset()
+    return frozenset(tuple(seq[i : i + size]) for i in range(len(seq) - size + 1))
+
+
+def _rp_jaccard(a: frozenset, b: frozenset) -> float:
+    union = a | b
+    if not union:
+        return 1.0
+    return len(a & b) / len(union)
+
+
+def _rp_lz76_norm(s: str) -> float:
+    """Normalized Lempel-Ziv-76 complexity (lower = more repetitive)."""
+    n = len(s)
+    if n <= 1:
+        return 0.0
+    i, k, l, c, k_max = 0, 1, 1, 1, 1
+    while True:
+        if s[i + k - 1] == s[l + k - 1]:
+            k += 1
+            if l + k > n:
+                c += 1
+                break
+        else:
+            if k > k_max:
+                k_max = k
+            i += 1
+            if i == l:
+                c += 1
+                l += k_max
+                if l + 1 > n:
+                    break
+                i, k, k_max = 0, 1, 1
+            else:
+                k = 1
+    return c / (n / math.log2(n)) if n > 1 else 0.0
+
+
+def _rp_entropy_rate(seq: list[str]) -> float:
+    """Order-1 conditional entropy H(a_t | a_{t-1}) in bits (lower = predictable)."""
+    if len(seq) < 2:
+        return 0.0
+    pair_counts: Counter = Counter(zip(seq[:-1], seq[1:]))
+    prev_counts: Counter = Counter(seq[:-1])
+    total = float(len(seq) - 1)
+    h = 0.0
+    for (prev, _cur), cnt in pair_counts.items():
+        p_pair = cnt / total
+        p_cond = cnt / prev_counts[prev]
+        h -= p_pair * math.log2(p_cond)
+    return h
+
+
+def _rp_features(
+    action_signatures: list[tuple[str, ...]],
+    amount_bucket_signatures: list[tuple[str, ...]],
+    street_signatures: list[tuple[str, ...]],
+) -> dict[str, float]:
+    n_all = len(action_signatures)
+    out: dict[str, float] = {}
+    if n_all < 2:
+        return {
+            "rp_pair_jaccard_mean": 0.0,
+            "rp_vendi_frac": 1.0,
+            "rp_exact_dup_frac_action": 0.0,
+            "rp_exact_dup_frac_rich": 0.0,
+            "rp_gzip_ratio": 1.0,
+            "rp_lz76_norm": 0.0,
+            "rp_entropy_rate": 0.0,
+        }
+
+    # rich token per action position: street+action+amount-bucket (all sanitization-surviving)
+    rich_signatures = [
+        tuple(f"{s}|{a}|{b}" for s, a, b in zip(st, at, bk))
+        for st, at, bk in zip(street_signatures, action_signatures, amount_bucket_signatures)
+    ]
+
+    # exact duplication (whole-hand template reuse)
+    out["rp_exact_dup_frac_action"] = 1.0 - _safe_div(len(set(action_signatures)), n_all)
+    out["rp_exact_dup_frac_rich"] = 1.0 - _safe_div(len(set(rich_signatures)), n_all)
+
+    # deterministic stride subsample for the pairwise block
+    stride = max(1, n_all // _RP_MAX_HANDS)
+    idx = list(range(0, n_all, stride))[:_RP_MAX_HANDS]
+    bigrams = [_rp_ngram_set(rich_signatures[i], 2) for i in idx]
+    n = len(bigrams)
+
+    sims: list[float] = []
+    row_sums = [0.0] * n
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = _rp_jaccard(bigrams[i], bigrams[j])
+            sims.append(s)
+            row_sums[i] += s
+            row_sums[j] += s
+    out["rp_pair_jaccard_mean"] = _mean_or(sims, 0.0)
+
+    # Vendi-style effective-diversity fraction from the similarity matrix's
+    # row-normalized spectrum proxy: exp(entropy of normalized row masses)/n.
+    total_mass = sum(row_sums) + n  # + diagonal ones
+    if total_mass > 0:
+        weights = [(rs + 1.0) / total_mass for rs in row_sums]
+        ent = -sum(w * math.log(w) for w in weights if w > 0)
+        out["rp_vendi_frac"] = _clamp01(math.exp(ent) / n)
+    else:
+        out["rp_vendi_frac"] = 1.0
+
+    # compression: gzip(concatenated hand strings) vs sum of per-hand gzips.
+    # Lower ratio = cross-hand redundancy (repetitive/bot-like).
+    hand_strs = ["".join(t[:1] for t in sig) or "-" for sig in rich_signatures]
+    joined = ("#".join(hand_strs)).encode()
+    whole = len(_gzip.compress(joined, 5))
+    parts = sum(len(_gzip.compress(s.encode(), 5)) for s in hand_strs) or 1
+    out["rp_gzip_ratio"] = whole / parts
+
+    # stream-level structure over the flat action-type sequence. LZ76 is
+    # quadratic-ish, so cap its window; repetition shows up well within it.
+    flat_actions = [a for sig in action_signatures for a in sig]
+    flat_str = "".join(a[:1] or "?" for a in flat_actions)
+    out["rp_lz76_norm"] = _rp_lz76_norm(flat_str[:300])
+    out["rp_entropy_rate"] = _rp_entropy_rate(flat_actions[: 100 * 40])
+    return out
+
+
+def _mean_or(values: list[float], default: float) -> float:
+    return sum(values) / len(values) if values else default
